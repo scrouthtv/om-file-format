@@ -7,37 +7,42 @@ use bindgen::EnumVariation;
 struct BuildConfig {
     // target: String,
     arch: String,
+    target: String,
     sysroot: Option<String>,
     is_windows: bool,
 }
 
 fn get_build_config() -> BuildConfig {
+    let target = env::var("TARGET").unwrap();
     BuildConfig {
         arch: env::var("CARGO_CFG_TARGET_ARCH").unwrap(),
         sysroot: env::var("SYSROOT").ok(),
-        is_windows: env::var("TARGET").unwrap().contains("windows"),
+        is_windows: target.contains("windows"),
+        target,
     }
 }
 
-fn setup_compiler(build: &mut cc::Build) -> cc::Tool {
-    // Check if CC is set in environment
-    if let Ok(cc) = env::var("CC") {
-        build.compiler(cc);
-    } else {
-        // Try using clang if available
-        let clang_available = Command::new("clang")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-
-        if clang_available {
-            build.compiler("clang");
-        }
-        // Otherwise cc::Build will use system default
+// The NDK's clang wrapper scripts (set as CC via cargo-ndk) embed the API
+// level in the target triple, but bindgen talks to libclang directly and
+// needs an explicit versioned triple (e.g. "aarch64-linux-android24"), or
+// libclang rejects the NDK sysroot headers with "Unversioned target triples
+// are not supported!".
+fn android_clang_target(target: &str) -> Option<String> {
+    if !target.contains("android") {
+        return None;
     }
+    // Only trust env vars holding a plain numeric API level (e.g. "21"); other
+    // tooling sometimes sets ANDROID_PLATFORM to an ABI name like "arm64-v8a".
+    let api_level = env::var("CARGO_NDK_ANDROID_PLATFORM")
+        .or_else(|_| env::var("ANDROID_PLATFORM"))
+        .ok()
+        .filter(|v| v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty())
+        .unwrap_or_else(|| "21".to_string());
+    Some(format!("{}{}", target, api_level))
+}
 
-    build.get_compiler()
+fn setup_compiler(build: &mut cc::Build) -> cc::Tool {
+    cc::Build::get_compiler(&build)
 }
 
 fn configure_build_flags(build: &mut cc::Build, config: &BuildConfig, compiler: &cc::Tool) {
@@ -72,15 +77,21 @@ fn configure_build_flags(build: &mut cc::Build, config: &BuildConfig, compiler: 
     }
 }
 
-fn generate_bindings(submodule: &str, sysroot: &Option<String>) {
-    let bindings = bindgen::Builder::default()
+fn generate_bindings(submodule: &str, sysroot: &Option<String>, target: &str) {
+    let mut builder = bindgen::Builder::default()
         // Set sysroot for bindgen if specified (for cross compilation)
         .clang_arg(
             sysroot
                 .as_ref()
                 .map_or("".to_string(), |s| format!("--sysroot={}", s)),
         )
-        .clang_arg(format!("-I{}/include", submodule))
+        .clang_arg(format!("-I{}/include", submodule));
+
+    if let Some(android_target) = android_clang_target(target) {
+        builder = builder.clang_arg(format!("--target={}", android_target));
+    }
+
+    let bindings = builder
         .header(format!("{}/include/om_file_format.h", submodule))
         // This tells bindgen to generate Rust enums.
         // Rust enums have the downside of potentially causing UB
@@ -145,7 +156,7 @@ fn main() {
     build.warnings(false);
     build.compile(LIB_NAME);
 
-    generate_bindings(submodule_path, &config.sysroot);
+    generate_bindings(submodule_path, &config.sysroot, &config.target);
 
     // Link the static library
     println!("cargo:rustc-link-lib=static={}", LIB_NAME);
